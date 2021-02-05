@@ -3,16 +3,14 @@
 
 import asyncio
 import click
+import gpiozero
 import os
-import signal
-import sqlite3
 import sys
 import time
 import traceback
 
 from datetime import datetime
 from enum import Enum
-from tabulate import tabulate
 
 # -----------------------------------------------------------------------------
 # Handle situation where user attempts to run on something other than a
@@ -24,6 +22,7 @@ try:
 
 except ModuleNotFoundError:
 
+    print("Raspberry Pi with SenseHAT required.")
     sys.exit()
 
 # Initialize the Sense HAT.
@@ -41,130 +40,92 @@ LED_MATRIX = [
     O, O, O, O, O, O, O, O,
 ]
 
+# Keeps track of the current temperature in fahrenheit.
 CURRENT_TEMPERATURE = 0.0
 
 # -----------------------------------------------------------------------------
 # Core asynchronous functions.
 # -----------------------------------------------------------------------------
-async def loop_led_matrix_update():
+async def loop_update_led_matrix(temperature_lower, temperature_upper, update_interval):
 
-    global LED_MATRIX
-    global PICYCLE_STATE
+    global CURRENT_TEMPERATURE
 
-    while PICYCLE_STATE == PicycleState.RUNNING:
+    click.echo("Starting updates for LED matrix...")
 
-        SENSE.set_pixels(LED_MATRIX)
+    while True:
 
-        await asyncio.sleep(1)
+        if CURRENT_TEMPERATURE < temperature_lower:
 
-    click.echo("Stopping LED matrix updates...")
+            SENSE.clear((0, 0, 255))
 
-async def loop_track_satellites():
+        elif CURRENT_TEMPERATURE > temperature_upper:
 
-    global LED_MATRIX
-    global PICYCLE_STATE
+            SENSE.clear((255, 0, 0))
 
-    while PICYCLE_STATE == PicycleState.RUNNING:
+        else:
 
-        for x in range(gpsd.get_current().sats):
+            SENSE.clear((255, 255, 255))
 
-            if x % 2 == 0:
+        # Wait before the next update.
+        await asyncio.sleep(update_interval)
 
-                idx = 0
+    click.echo("Stopping updates for LED matrix...")
 
-            else:
+async def loop_update_relay(temperature_lower, temperature_upper, update_interval, use_fahrenheit=False):
 
-                idx = 8
-
-            idx = idx + (x // 2)
-
-            if 0 <= x <= 3:
-
-                LED_MATRIX[idx] = (255, 0, 0)
-
-            elif 3 < x < 8:
-
-                LED_MATRIX[idx] = (255, 255, 0)
-
-            elif 8 <= x <= 16:
-
-                LED_MATRIX[idx] = (0, 255, 0)
-
-        await asyncio.sleep(1)
-
-    click.echo("Stopping tracking satellites...")
-
-async def loop_update_relay(temperature_lower, temperature_upper, update_interval):
+    global CURRENT_TEMPERATURE
 
     click.echo("Starting updates for relay...")
+
+    relay = gpiozero.OutputDevice(17, active_high=True, initial_value=False)
+
+    import random
+
+    # Unit for printing.
+    unit = "F" if use_fahrenheit else "C"
 
     while True:
 
         # Get the current temperature in celsius.
-        temperature = round(SENSE.get_temperature(), 2)
+        CURRENT_TEMPERATURE = SENSE.get_temperature()
 
         # Convert to fahrenheit.
-        temperature = (temperature * 9 / 5) + 32
+        if use_fahrenheit:
 
-        # Get the current date and time.
-        now = datetime.now()
+            CURRENT_TEMPERATURE = (CURRENT_TEMPERATURE * 9 / 5) + 32
 
-        if temperature < temperature_lower: # and GPIO.is_off()
+        # TODO: Testing with random temperature.
+        CURRENT_TEMPERATURE = random.randint(25, 45)
 
-            # Turn on the GPIO.
+        # Print the current temperature.
+        to_print = f"Current Temperature: {round(CURRENT_TEMPERATURE, 2)}°{unit}"
 
-        if temperature > temperature_upper: # and GPIO.is_on()
+        if CURRENT_TEMPERATURE < temperature_lower:
 
-            # Turn off the GPIO.
+            click.echo(click.style(to_print, bg="blue"))
 
-        # Wait before the next update.
-        time.sleep(update_interval)
+        elif CURRENT_TEMPERATURE > temperature_upper:
 
-    click.echo("Stopping updates for relay...")
+            click.echo(click.style(to_print, bg="red"))
 
-    global LED_MATRIX
-    global PICYCLE_STATE
-    global SESSION_STATE
-
-    # When run as a service, it's common to encounter SIGTERM. This is needed
-    # to clear
-    def sigterm_handler(signum, stack_frame):
-
-        global PICYCLE_STATE
-
-        PICYCLE_STATE = PicycleState.TERMINATE
-
-    signal.signal(signal.SIGTERM, sigterm_handler)
-
-    while PICYCLE_STATE == PicycleState.RUNNING:
-
-        for i in range(16, 24):
-
-            LED_MATRIX[i] = (255, 255, 255)
-
-        if SESSION_STATE != SessionState.IN_PROGRESS:
-
-            await asyncio.sleep(1)
-            continue
-
-        for i in range(16, 24):
-
-            LED_MATRIX[i] = (0, 0, 255)
-
-        # Get the current date and time, used for creating a new SQLite database.
-        now = datetime.now().strftime('%Y%m%d-%H-%M-%S')
-
-        # Connect to the SQLite database.
-        db = f"{now}-picycle.sqlite"
-        connection = create_connection(db)
-
-        # Otherwise report the error and exit.
         else:
 
-            SENSE.show_letter("E", (255, 0, 0))
-            time.sleep(3)
-            SENSE.clear()
-            sys.exit(1)
+            click.echo(to_print)
+
+        if CURRENT_TEMPERATURE < temperature_lower and relay.value == 0:
+
+            relay.on()
+            click.echo("Turning Relay On")
+
+        if CURRENT_TEMPERATURE > temperature_upper and relay.value == 1:
+
+            relay.off()
+            click.echo("Turning Relay Off")
+
+        # Wait before the next update.
+        await asyncio.sleep(update_interval)
+
+    click.echo("Stopping updates for relay...")
 
 # -----------------------------------------------------------------------------
 # Controller commands.
@@ -175,42 +136,62 @@ def cli():
     pass
 
 @cli.command()
-@click.argument("temperature_lower")
-@click.argument("temperature_upper")
-@click.argument("update_interval")
+@click.option("--temperature-lower", default=35.0, help="Relay will be enabled below this temperature.")
+@click.option("--temperature-upper", default=40.0, help="Relay will be disabled above this temperature.")
+@click.option("--update-interval", default=60, help="Update interval for the controller.")
+@click.option("--use-fahrenheit/--no-use-fahrenheit", default=False, help="Use fahrenheit instead of celsius.")
 @click.option("--verbose/--no-verbose", default=False)
-def control(temperature_lower, temperature_upper, update_interval, verbose):
+def control(temperature_lower, temperature_upper, update_interval, use_fahrenheit, verbose):
+
+    # Sanity checks for user input.
+    assert temperature_lower < temperature_upper
+    assert update_interval > 0
 
     try:
 
         # Run the session, consisting of asynchronous tasks.
-        asyncio.run(session(temperature_lower, temperature_upper, update_interval, verbose))
+        asyncio.run(
+            session(
+                temperature_lower,
+                temperature_upper,
+                update_interval,
+                use_fahrenheit,
+                verbose
+            )
+        )
 
     except Exception:
 
         # Print the contents of the traceback.
-        print(trackback.print_exc())
+        click.echo(traceback.print_exc())
 
     finally:
 
         # Clear the SenseHAT LED matrix.
         SENSE.clear()
 
-async def session(temperature_lower, temperature_upper, update_interval, verbose=False):
+async def session(temperature_lower, temperature_upper, update_interval, use_fahrenheit=False, verbose=False):
 
     if verbose:
 
         click.echo("Session has started...")
 
     # Create an asynchronous task for updating the LED matrix.
-    task_1 = asyncio.create_task(loop_update_led_matrix())
+    task_1 = asyncio.create_task(
+        loop_update_led_matrix(
+            temperature_lower,
+            temperature_upper,
+            1
+        )
+    )
 
     # Create an asynchronous task for updating the relay.
     task_2 = asyncio.create_task(
         loop_update_relay(
             temperature_lower,
             temperature_upper,
-            update_interval
+            update_interval,
+            use_fahrenheit
         )
     )
 
@@ -222,3 +203,6 @@ async def session(temperature_lower, temperature_upper, update_interval, verbose
 
         click.echo("Session has ended...")
 
+if __name__ == '__main__':
+
+    cli()
